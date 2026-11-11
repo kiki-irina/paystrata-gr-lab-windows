@@ -2,11 +2,22 @@ PAYSTRATA GR LAB: WINDOWS (WSL2) SETUP
 ======================================
 
 The lab is the same as the Mac one: the same scripts, the same docker-compose.yml, the same results.
-On Windows the scripts run in WSL2 (a real Ubuntu inside Windows). Docker Desktop runs the containers.
-You do not rewrite or change anything: ./step1_cluster.sh ... ./step5_routing.sh work as in LAB_GUIDE.txt.
+On Windows the scripts run in WSL2 (a real Ubuntu inside Windows), because they are bash scripts.
+Docker Desktop runs the containers. Nothing to rewrite: ./step1_cluster.sh ... ./step5_routing.sh
+work as in LAB_GUIDE.txt.
 
-What you need:  Windows 10 (22H2) or 11, virtualization enabled in the BIOS, 6 CPUs and 10 GB RAM
-                free for the full lab (4 CPUs / 8 GB for the small size: SIZE=small).
+WHAT YOU NEED (ONCE)
+--------------------
+1. Windows 10 (22H2) or 11 with Docker Desktop (WSL 2 backend, the default).
+   https://www.docker.com/products/docker-desktop/
+   Give it at least 4 CPUs and 8 GB RAM for the small size, 6 CPUs and 10 GB for the full lab.
+   With WSL 2 this is set in %UserProfile%\.wslconfig (section 3).
+2. WSL2 with Ubuntu (section 1). The lab commands run in the Ubuntu terminal, not in cmd and
+   not in PowerShell. PowerShell is only for the "wsl" commands.
+3. Git and Python 3 inside Ubuntu (section 5). Python is only for the charts.
+4. Ports 3307, 3308, 3309, 6032 and 6033 free.
+
+Start Docker Desktop and wait until it says "Engine running".
 
 
 1. INSTALL WSL2 + UBUNTU  (PowerShell as Administrator, once)
@@ -56,7 +67,7 @@ Then open Ubuntu again and Docker Desktop. Check inside Ubuntu:
 Clone or copy the repository into your Ubuntu home, NOT under /mnt/c/...:
 
     cd ~
-    git clone https://github.com/<you>/paystrata-gr-lab-windows.git
+    git clone https://github.com/kiki-irina/paystrata-gr-lab-windows.git
     cd paystrata-gr-lab-windows
     chmod +x *.sh
 
