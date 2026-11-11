@@ -1,0 +1,40 @@
+services:
+  mysql1:
+    image: mysql:8.0
+    hostname: mysql1
+    environment: { MYSQL_ROOT_PASSWORD: paystrata }
+    volumes:
+      - ./conf/mysql1.cnf:/etc/mysql/conf.d/gr.cnf:ro
+    ports: ["3307:3306"]
+  mysql2:
+    image: mysql:8.0
+    hostname: mysql2
+    environment: { MYSQL_ROOT_PASSWORD: paystrata }
+    volumes:
+      - ./conf/mysql2.cnf:/etc/mysql/conf.d/gr.cnf:ro
+    ports: ["3308:3306"]
+  mysql3:                     # only started with NODES=3
+    image: mysql:8.0
+    hostname: mysql3
+    environment: { MYSQL_ROOT_PASSWORD: paystrata }
+    volumes:
+      - ./conf/mysql3.cnf:/etc/mysql/conf.d/gr.cnf:ro
+    ports: ["3309:3306"]
+  proxysql:
+    image: proxysql/proxysql:3.0.12
+    hostname: proxysql
+    profiles: ["proxy"]
+    ulimits: { nofile: { soft: 65536, hard: 65536 } }
+    volumes:
+      - ./conf/${PROXY_CNF:-proxysql.cnf}:/etc/proxysql.cnf
+    ports: ["6033:6033", "6032:6032"]
+  shell:                      # admin box: mysqlsh + mysql client, survives node crashes
+    image: mysql:8.4          # this image ships MySQL Shell (mysql:8.0 does not); it talks to the 8.0 nodes
+    hostname: shell
+    command: ["sleep", "infinity"]
+  loadgen:
+    build: ./loadgen
+    profiles: ["tools"]
+    cpus: 1.5                 # the load generator must not starve the cluster
+    ulimits: { nofile: { soft: 65536, hard: 65536 } }
+    volumes: ["./results:/results"]

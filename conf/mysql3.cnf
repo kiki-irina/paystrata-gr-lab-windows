@@ -1,0 +1,23 @@
+[mysqld]
+server_id=3
+report_host=mysql3
+max_connections=1000
+gtid_mode=ON
+enforce_gtid_consistency=ON
+log_bin=binlog
+binlog_format=ROW
+log_replica_updates=ON
+plugin_load_add=group_replication.so
+loose-group_replication_group_name="a3a1fcd9-5d3e-4c5a-9c5e-0a1b2c3d4e5f"
+loose-group_replication_start_on_boot=OFF
+loose-group_replication_local_address="mysql3:33061"
+loose-group_replication_group_seeds="mysql1:33061,mysql2:33061,mysql3:33061"
+loose-group_replication_bootstrap_group=OFF
+loose-group_replication_single_primary_mode=ON
+loose-group_replication_recovery_get_public_key=ON
+# parallel appliers, as required by MySQL Shell (no dba.configureInstance() needed)
+binlog_transaction_dependency_tracking=WRITESET
+transaction_write_set_extraction=XXHASH64
+replica_parallel_type=LOGICAL_CLOCK
+replica_parallel_workers=4
+replica_preserve_commit_order=ON

@@ -1,0 +1,103 @@
+PAYSTRATA GR LAB: WINDOWS (WSL2) SETUP
+======================================
+
+The lab is the same as the Mac one: the same scripts, the same docker-compose.yml, the same results.
+On Windows the scripts run in WSL2 (a real Ubuntu inside Windows). Docker Desktop runs the containers.
+You do not rewrite or change anything: ./step1_cluster.sh ... ./step5_routing.sh work as in LAB_GUIDE.txt.
+
+What you need:  Windows 10 (22H2) or 11, virtualization enabled in the BIOS, 6 CPUs and 10 GB RAM
+                free for the full lab (4 CPUs / 8 GB for the small size: SIZE=small).
+
+
+1. INSTALL WSL2 + UBUNTU  (PowerShell as Administrator, once)
+-------------------------------------------------------------
+    wsl --install -d Ubuntu
+    (restart Windows if it asks; then open "Ubuntu" from the Start menu and create a user)
+    wsl --set-default-version 2
+    wsl -l -v                              Ubuntu must show VERSION 2
+
+
+2. INSTALL DOCKER DESKTOP
+-------------------------
+Download Docker Desktop for Windows. In Settings:
+    General              "Use the WSL 2 based engine"  ON
+    Resources > WSL integration   "Enable integration with my default WSL distro" ON, and Ubuntu ON
+Apply & restart. In the Ubuntu terminal:
+
+    docker compose version
+    docker run --rm hello-world
+
+Both must work. The scripts use "docker compose" (or "docker-compose") automatically.
+
+
+3. GIVE WSL2 ENOUGH CPU AND MEMORY
+----------------------------------
+Docker Desktop with WSL2 does not have a CPU/memory slider: the limits come from one file.
+In Windows, create C:\Users\<your user>\.wslconfig (a text file, no .txt extension):
+
+    [wsl2]
+    memory=10GB
+    processors=6
+    swap=4GB
+
+For the small size (students): memory=8GB and processors=4.
+Apply it in PowerShell:
+
+    wsl --shutdown
+
+Then open Ubuntu again and Docker Desktop. Check inside Ubuntu:
+
+    nproc            number of CPUs
+    free -h          memory
+
+
+4. PUT THE LAB IN THE LINUX FILE SYSTEM  (important)
+----------------------------------------------------
+Clone or copy the repository into your Ubuntu home, NOT under /mnt/c/...:
+
+    cd ~
+    git clone https://github.com/<you>/paystrata-gr-lab-windows.git
+    cd paystrata-gr-lab-windows
+    chmod +x *.sh
+
+Why: under /mnt/c the files are slow, the MySQL config files look world-writable and mysqld ignores
+them ("config file is world-writable, ignoring"), and Windows line endings (CRLF) break the scripts
+("bad interpreter", "\r: command not found").
+
+If you already have CRLF files:     sudo apt install -y dos2unix && dos2unix *.sh conf/* loadgen/*
+
+
+5. TOOLS INSIDE UBUNTU  (once)
+------------------------------
+    sudo apt update
+    sudo apt install -y git python3 python3-venv
+
+python3-venv is needed by ./plot.sh (it creates .venv with matplotlib the first time).
+
+
+6. RUN THE LAB
+--------------
+Everything is exactly as in LAB_GUIDE.txt, in the Ubuntu terminal:
+
+    ./step1_cluster.sh
+    ./step2_limit.sh               (small size:  SIZE=small ./step2_limit.sh)
+    ./step3_proxy.sh
+    ./step4_failover.sh
+    ./step5_routing.sh
+    ./plot.sh                      charts in results/ (open them from Windows: explorer.exe results)
+
+Second terminal for the live view:   ./watch_servers.sh
+Connect to ProxySQL admin:           docker compose exec shell mysql -h proxysql -P6032 -uradmin -pradmin
+From Windows tools (DBeaver, etc.):  127.0.0.1 ports 3307-3309 (MySQL), 6033 (proxy), 6032 (admin)
+
+
+TROUBLESHOOTING
+---------------
+"bad interpreter: /usr/bin/env bash^M"       CRLF line endings: dos2unix *.sh (see 4)
+"mysqld: ... config file ... world-writable" the lab is under /mnt/c: move it to ~ (see 4)
+"docker: command not found" in Ubuntu         Docker Desktop > Settings > Resources > WSL integration: Ubuntu ON
+Step 2 or 3 killed or very slow               raise memory in .wslconfig (12GB), wsl --shutdown, retry;
+                                              or LEVELS=1000,2000,5000 ./step2_limit.sh
+"Workspace/Docker is slow"                    close other apps; the lab needs the CPUs you gave in .wslconfig
+Ports 3307-3309, 6032, 6033 are busy          another program uses them (netstat -ano in PowerShell), or change docker-compose.yml
+Free the memory after the lab                 PowerShell: wsl --shutdown

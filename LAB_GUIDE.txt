@@ -1,0 +1,457 @@
+PAYSTRATA LAB: CONNECTION LIMITS, PROXYSQL AND THE CRASH OF THE PRIMARY
+=======================================================================
+
+THE STORY
+---------
+PayStrata runs on a 3-node MySQL Group Replication cluster: one PRIMARY takes the writes,
+two SECONDARIES copy them. During the day more application pods start, every pod opens its
+connections straight to the primary, and at peak time 10,000 clients want to connect.
+The primary is NOT dead. It is up, the group sees it ONLINE. It simply refuses new
+connections (error 1040, Too many connections) because it reached max_connections = 1000.
+You reproduce it, measure it, and then put ProxySQL in front of the nodes. The same 10,000
+clients connect, MySQL stays under its limit. At the end the primary really dies, and you
+watch the group elect a new one while ProxySQL moves the connections.
+
+
+THE ORDER (the environment lives from step 1 to step 5, nothing is rebuilt in between)
+---------------------------------------------------------------------------------------
+STEP 1  ./step1_cluster.sh    create the 3-node cluster; check containers; check cluster status
+STEP 2  ./step2_limit.sh      (3 terminals, see below) no proxy. Ramp up to 10,000 client connections straight to the
+                              primary. It stops at 1,000. Statistics, validation, error log.
+STEP 3  ./step3_proxy.sh      start ProxySQL; check containers and runtime servers; run the
+                              same ramp through the proxy. Same statistics and validation.
+STEP 4  ./step4_failover.sh   under load, kill the primary. The group elects a new one,
+                              ProxySQL moves the writer hostgroup, the app does not change.
+STEP 5  ./step5_routing.sh    where do SELECT and UPDATE go? Then kill the primary again and
+                              run the same statements: the writes follow the new primary.
+
+Then:   ./plot.sh             charts: results/connections.png (steps 2-3), results/crash.png (step 4)
+        ./rejoin.sh           bring the killed primary back as a secondary
+        ./run_all.sh          steps 1-5, charts, and a clean destroy at the end
+
+WHY 3 NODES (and not 2)
+  A group needs a MAJORITY to accept writes. With 3 nodes, if one dies the 2 survivors are a
+  majority: the group elects a new primary by itself. With 2 nodes, if one dies the survivor
+  is only 1 of 2: no majority, writes are blocked, and a human has to run
+  group_replication_force_members. That is why the lab uses 3 nodes. The 2-node case is kept
+  as an optional demonstration (see EXTRA at the end).
+
+
+FILES IN THIS FOLDER
+--------------------
+  LAB_GUIDE.txt            this guide
+  docker-compose.yml       mysql1, mysql2, mysql3, proxysql, shell, loadgen
+  conf/                    mysql1-3.cnf (Group Replication), proxysql3.cnf (3 nodes), proxysql.cnf (2 nodes, EXTRA)
+  loadgen/                 connramp.py (steps 2-3), loadgen.py (step 4)
+  setup_env.sh             rebuilds the environment from scratch (called by step 1)
+  step1_cluster.sh ... step5_routing.sh
+  conn_ramp.sh             the common script of steps 2-3
+  scenario.sh              the common script of step 4 and of the EXTRA tests
+  check_status.sh          group state seen from each node, with mysqlsh
+  proxy_status.sh          ProxySQL: servers, rule hits, connection pool
+  watch_servers.sh         live runtime_mysql_servers, for a second terminal
+  rejoin.sh                brings the killed mysql1 back as a secondary
+  extra_2nodes_noproxy.sh, extra_2nodes_proxy.sh     the optional 2-node demonstrations
+  plot.sh, plot.py, plot_conn.py                     the charts
+  run_all.sh
+
+
+FOR STUDENTS (a normal laptop)
+------------------------------
+The full lab (limit 1,000, up to 10,000 clients) needs about 6 CPUs and 10 GB for the Docker
+runtime. A student laptop with 4 CPUs / 8 GB runs the small size: the same story, ten times smaller.
+
+    (Windows: .wslconfig with memory=8GB and processors=4, see WINDOWS_SETUP.txt; then wsl --shutdown)
+    ./step1_cluster.sh
+    SIZE=small ./step2_limit.sh       limit 100, clients 100 -> 200 -> 500 -> 1,000
+    SIZE=small ./step3_proxy.sh       the same ramp through ProxySQL
+    ./step4_failover.sh               light (40 connections), no change needed
+    ./step5_routing.sh                light, no change needed
+
+On Windows the CPUs and memory of Docker come from the WSL2 file C:\Users\<you>\.wslconfig. If it is still slow, use 2 nodes less
+(skip mysql3: NODES=2 ./setup_env.sh) or LEVELS=100,200,500 SIZE=small ./step2_limit.sh.
+
+SETUP (ONCE)
+------------
+1. Give WSL2 enough memory (10,000 client threads need it). In C:\Users\<you>\.wslconfig:
+
+    [wsl2]
+    memory=10GB
+    processors=6
+
+   then, in PowerShell:   wsl --shutdown   and open Ubuntu again. WINDOWS_SETUP.txt has all the steps.
+
+2. Check that everything is there:
+
+    docker compose version
+    docker info | grep -E "CPUs|Total Memory"
+    python3 --version
+
+   If your machine has "docker compose" (with a space), the scripts use it automatically.
+   Run every command in the Ubuntu (WSL2) terminal, inside the Linux file system (~/paystrata-gr-lab),
+   not under /mnt/c.
+
+3. The chart environment (.venv with matplotlib) is created by ./plot.sh the first time.
+
+    chmod +x *.sh
+
+
+THE ENVIRONMENT
+---------------
+  mysql1, mysql2, mysql3   MySQL 8.0, Group Replication, single-primary. mysql1 starts as PRIMARY.
+                           ports 3307, 3308, 3309 on your machine
+  proxysql                 user "app", ports 6033 (application) and 6032 (admin)
+  shell                    admin container with mysqlsh and the mysql client. It is not one of
+                           the nodes, so it survives their crashes.
+
+ProxySQL:
+  HG10 = writer, HG20 = readers. The monitor reads read_only on every node: 0 = writer,
+  1 = reader. After a failover the new primary has read_only=0 and ProxySQL moves it to HG10.
+  Rules, evaluated by rule_id, the first match wins:
+
+    10  ^SELECT .* FOR UPDATE            -> HG10   (it takes locks, it must go to the primary)
+    20  ^SELECT                          -> HG20
+    30  ^(INSERT|UPDATE|DELETE|REPLACE)  -> HG10
+
+  Two limits: ProxySQL accepts up to 12,000 client connections (mysql-max_connections) and
+  opens at most 50 connections per MySQL server (mysql_servers.max_connections).
+
+
+STEP 1: THE CLUSTER
+-------------------
+    ./step1_cluster.sh
+
+It prints: the containers (docker compose ps), then the group as every node sees it, with mysqlsh.
+Expected: 3 members ONLINE, 1 PRIMARY (mysql1) and 2 SECONDARY; read_only=0 on the primary,
+super_read_only=1 on the others.
+
+    SELECT MEMBER_HOST, MEMBER_STATE, MEMBER_ROLE FROM performance_schema.replication_group_members;
+
+  ONLINE        member of the group, working
+  UNREACHABLE   the others cannot reach it (dead or only isolated)
+  PRIMARY       takes the writes        SECONDARY   applies the transactions
+
+By hand: docker compose exec shell mysqlsh --uri root:paystrata@mysql2:3306 --sql
+
+cluster.status() (MySQL Shell AdminAPI): the group is created with plain SQL, so mysqlsh sees it as an
+"unmanaged replication group". Step 1 adopts it into a managed cluster (./adopt_cluster.sh), it only adds
+the metadata schema and changes nothing in the group. After that:
+
+    docker compose exec shell mysqlsh --uri root:paystrata@mysql1:3306 --js
+    cluster = dba.getCluster()
+    cluster.status()
+    cluster.describe()
+    cluster.status({extended: 1})
+
+  or, in one go:  mysqlsh --uri root:paystrata@mysql1:3306 --cluster --js   (then just: cluster.status())
+  After a kill with 2 of 3 nodes left:   cluster.status()   shows the new primary, mysql1 as (MISSING)
+  Rejoin a node:     cluster.rejoinInstance('mysql1:3306')   (./rejoin.sh also works)
+
+
+STEP 2: THE LIMIT, NO PROXY
+---------------------------
+You need 3 terminals. The script runs in terminal A. In B you keep an observation session on the
+primary. In C you try new connections while the primary is full.
+
+TERMINAL B: open it FIRST, before the script, and keep it open. It holds a normal connection, so it
+is never refused. (Close any other mysql / mysqlsh session: the script needs the spare administrator
+connection of root, and it would be taken.)
+
+    docker compose exec shell mysqlsh --uri root:paystrata@mysql1:3306 --sql
+
+    SELECT COUNT(*) FROM performance_schema.processlist WHERE USER='app';      -- 0 now
+    SHOW GLOBAL VARIABLES LIKE 'max_connections';                              -- 1000
+    SHOW GLOBAL STATUS LIKE 'Connection_errors_max_connections';
+    SHOW GLOBAL STATUS LIKE 'Max_used_connections';                            -- 1001 after the ramp
+
+TERMINAL A: the ramp. Use HOLD=60 so that the level of 2,000 gives you time to look around:
+
+    HOLD=60 LEVELS=1000,2000 ./step2_limit.sh                  the demonstration (2 levels)
+    HOLD=60 LEVELS=1000,2000,5000 ./step2_limit.sh             with the level of 5,000
+    ./step2_limit.sh                                           the full ramp: 1,000 / 2,000 / 5,000 / 10,000
+
+MySQL gets max_connections = 1000 on all nodes. Every level opens N NEW client connections straight
+to mysql1 (the previous level is closed first). Every client holds its connection and runs one
+statement every ~3 seconds (80% SELECT, 20% UPDATE on one of 100 rows), like a pod with a pool, mostly
+idle. A refused client retries every 3 seconds, like a pod in a restart loop. The clients are one
+asyncio process: with one thread per client the generator needed about 600 KB each and the Linux
+kernel killed it (exit code 137) at 5,000 clients.
+
+For every level it prints:
+  clients        how many clients try to connect
+  connected      how many hold a connection at the end of the level
+  refused        clients that did not get in at all (clients - connected)
+  attempts       refused ATTEMPTS, ERROR 1040 Too many connections. A refused client retries every
+                 3 seconds, so 1,000 refused clients make about 9,000 attempts in a 30 s level
+  queries/s      statements completed per second
+  on_mysql       application connections inside MySQL (performance_schema.processlist)
+
+While the ramp runs, every ~3 seconds a RAM line is printed: the memory of the mysql1, mysql2 and
+mysql3 containers (and of ProxySQL and of the load generator) next to the number of connections inside
+mysql1. At the end: "RAM PER CONNECTION", (peak - start) / connections: the number to multiply by the
+connections of a production instance. Data: results/test1_ram.csv.
+
+WHAT TO DO DURING THE LEVEL OF 2,000 (about 40 seconds after the start)
+
+  Terminal B: repeat the count. It stays at about 1,000 and the refused counter keeps growing.
+
+      SELECT COUNT(*) FROM performance_schema.processlist WHERE USER='app';
+      SHOW GLOBAL STATUS LIKE 'Connection_errors_max_connections';
+      SHOW GLOBAL STATUS LIKE 'Threads_connected';
+      SELECT USER, COUNT(*) FROM performance_schema.processlist GROUP BY USER;
+
+      Threads_connected reaches 1000 + 1. The "+1" is root: MySQL keeps ONE spare connection above
+      max_connections for an account with CONNECTION_ADMIN (or SUPER), so an administrator can still
+      get in to fix a full server. In the GROUP BY you see "app" with about 1,000 and "root" with a
+      few (your session B, the script's measuring connection, the shell). Every other account is
+      refused at 1000. Afterwards Max_used_connections = 1001: 1,000 + 1 root.
+
+  Terminal C, 1) another connection to mysql1 as the application user. It must be REFUSED:
+
+      docker compose exec shell mysql -h mysql1 -uapp -papp_pass paystrata -e "SELECT 1"
+
+        ERROR 1040 (HY000): Too many connections
+
+      (root is not a good test: it has CONNECTION_ADMIN and may use one extra connection above the
+       limit. The application user "app" has no such privilege.)
+
+  Terminal C, 2) the same attempt on mysql2. It WORKS: the node is idle, the application never
+  goes there:
+
+      docker compose exec shell mysql -h mysql2 -uapp -papp_pass paystrata -e "SELECT @@hostname"
+
+  Terminal C, 3) the cluster, seen by MySQL Shell, connected to mysql2 (not to mysql1):
+
+      docker compose exec shell mysqlsh --uri root:paystrata@mysql2:3306 --cluster --js
+      cluster.status()
+
+        "mysql1:3306": { "memberRole": "PRIMARY", "memberState": "(MISSING)", "mode": "n/a",
+          "shellConnectError": "MySQL Error 1040: Could not open connection to 'mysql1:3306':
+          Too many connections", "status": "ONLINE" }
+
+      Why: cluster.status() reads the topology from the node you are connected to (mysql2), but then
+      the SHELL itself opens a connection to every member to read its mode, version and lag. The
+      shell cannot open one to mysql1, because mysql1 is full. For the group, mysql1 is ONLINE and
+      PRIMARY ("Cluster is ONLINE and can tolerate up to ONE failure"). The primary is not dead,
+      it is full. Do not use --cluster on mysql1 at that moment: it needs a second connection.
+      The group's own view, without touching mysql1, from mysql2:
+
+      SELECT MEMBER_HOST, MEMBER_STATE, MEMBER_ROLE FROM performance_schema.replication_group_members;
+
+  When the script ends the clients disconnect and mysql1 accepts connections again: repeat 1) and see
+  that it works.
+
+WHAT THE SCRIPT PRINTS AT THE END
+  STATISTICS   from MySQL: Connections accepted, Connection_errors_max_connections (refused),
+               Aborted_connects, Error 1040 raised, Max_used_connections (peak), as differences for
+               this run
+  VALIDATION   OK if the peak never went above max_connections (+1: the spare administrator slot), and
+               if MySQL refused connections (the limit was really reached)
+  ERROR LOG    performance_schema.error_log of mysql1 for the time of the run. A refusal by
+               max_connections is COUNTED, not written to the error log, so expect it to be empty.
+  It ends by showing that mysql1 is still ONLINE and PRIMARY for the group: alive, only full.
+
+EXPECTED (a real run, 6 CPUs / 10 GB)
+  1,000 clients   connected about 997-1000, refused 0-4, queries/s about 335
+  2,000 clients   connected about 972-998 (never above the limit), refused about 1,000,
+                  attempts about 8,000-9,000 (each refused client retries every 3 s)
+  The application only goes to mysql1: mysql2 and mysql3 are idle, with RAM flat.
+
+A smaller version for a quick check:  SIZE=small ./step2_limit.sh   (limit 100, up to 1,000 clients)
+
+
+STEP 3: THE PROXY
+-----------------
+    ./step3_proxy.sh
+
+It starts ProxySQL, prints the container and runtime_mysql_servers (mysql1 in HG10, mysql2 and
+mysql3 in HG20), runs the SAME ramp with the clients pointed at proxysql:6033 and prints the same
+statistics and validation. It also prints, per level:
+  proxy_clients  connections held by ProxySQL, from the application side
+  proxy_backend  connections ProxySQL holds towards MySQL (ConnUsed + ConnFree)
+
+Expected: connected = clients at every level (10,000 on the proxy), refused = 0, attempts = 0, on_mysql and
+proxy_backend stay small (never above 50 per server), "MySQL refused 0 connections".
+10,000 clients, a few dozen connections to MySQL: the idle clients cost MySQL nothing.
+
+Chart (./plot.sh): results/connections.png, 3 rows per step:
+  1. clients that try to connect versus clients connected
+  2. connections inside MySQL (red line = max_connections) and held by ProxySQL
+  3. refused attempts per level (red) and queries per second (orange)
+
+
+WHERE TO SEE THE PROXY WORK
+---------------------------
+At any moment:
+
+    docker compose exec shell mysql -h proxysql -P6032 -uradmin -pradmin -t -e "
+      SELECT hostgroup_id, hostname, status FROM runtime_mysql_servers ORDER BY hostgroup_id, hostname"
+
+A live view, in a second terminal:  ./watch_servers.sh
+
+    ./proxy_status.sh              servers, rules with hits, connection pool
+
+    SELECT rule_id, match_pattern, destination_hostgroup, hits
+      FROM runtime_mysql_query_rules JOIN stats_mysql_query_rules USING (rule_id);
+    SELECT hostgroup, srv_host, status, ConnUsed, ConnFree, Queries FROM stats_mysql_connection_pool;
+    SELECT hostgroup, digest_text, count_star FROM stats_mysql_query_digest ORDER BY count_star DESC;
+
+Your own statements through the proxy:
+
+    docker compose exec shell mysql -h proxysql -P6033 -uapp -papp_pass paystrata
+
+
+STEP 4: THE PRIMARY DIES
+------------------------
+    ./step4_failover.sh
+
+Under load (20 writer + 20 reader connections through the proxy, 80 seconds, one line per second):
+  t=15    docker kill mysql1  (a crash, not a clean shutdown)
+  ~t=25   the group notices mysql1 is UNREACHABLE; 2 of 3 members are a majority
+  next    the group expels mysql1 and elects a new primary by itself. The DBA does nothing.
+          ProxySQL sees read_only=0 on the new primary, moves it to HG10, the writes resume.
+
+The script prints runtime_mysql_servers three times: BEFORE the crash (mysql1 in HG10), right
+AFTER the crash (mysql1 SHUNNED/OFFLINE), and after the FAILOVER (the new primary in HG10).
+Expected: writes OK until t=15, then 0 for about 5-12 seconds, then OK again. Reads keep
+working on the secondaries. The result line shows the seconds with zero successful writes.
+
+Chart: results/crash.png, 3 rows: writes and reads OK per second with the events marked,
+application connections held by each node and by ProxySQL, failed operations per second.
+
+
+STEP 5: WHERE DO SELECT AND UPDATE GO?
+--------------------------------------
+    ./step5_routing.sh
+
+No load, single statements through the proxy.
+Phase 1 (the current primary): 8 x SELECT @@hostname, an UPDATE and an INSERT that record which
+node executed them, a SELECT ... FOR UPDATE, and a BEGIN..COMMIT with a SELECT inside. Each
+line shows the node that served it: SELECTs spread over the readers in HG20, writes always on
+the primary in HG10, the SELECT inside the transaction stays on the primary. Then rule hits,
+statements per hostgroup and queries sent per node.
+Phase 2: kills the primary, waits for the election, runs the SAME statements again. The writes
+now land on the new primary. Nothing changed in the application.
+Phase 2 kills whichever node is the primary at that moment. After step 4 run ./rejoin.sh first,
+so all 3 nodes are up (or start step 5 on a fresh cluster with ./step1_cluster.sh).
+
+
+AFTER A KILL: BRING THE NODE BACK
+---------------------------------
+    ./rejoin.sh
+
+mysql1 starts again, runs START GROUP_REPLICATION, receives what it missed and joins as a
+SECONDARY. In ProxySQL it moves to HG20 (watch it with ./watch_servers.sh). It is not the
+primary anymore: the roles do not go back by themselves.
+
+
+EXTRA: WHY 3 NODES? THE 2-NODE CRASH
+------------------------------------
+    ./extra_2nodes_noproxy.sh     2 nodes, no proxy (writes -> mysql1, reads -> mysql2)
+    ./extra_2nodes_proxy.sh       2 nodes, ProxySQL
+Each rebuilds the environment with 2 nodes. After docker kill mysql1 the survivor is 1 of 2:
+no majority, the group blocks writes and does NOT elect a primary. After 5 more seconds the
+script plays the DBA and runs group_replication_force_members='mysql2:33061'.
+Without proxy the writes keep failing until the end (the app still points at mysql1) while the
+reads work. With the proxy the writes resume once the DBA acts. They start from scratch, so
+run step 1 again afterwards.
+
+
+MANUAL COMMANDS (run everything yourself)
+-----------------------------------------
+Containers:
+    docker compose ps
+    docker compose logs --tail 50 mysql1
+
+Connect to a node (mysql client, inside the node):
+    docker compose exec mysql1 mysql -uroot -ppaystrata
+    docker compose exec mysql2 mysql -uroot -ppaystrata
+    docker compose exec mysql3 mysql -uroot -ppaystrata
+  or from your Mac, if you have a mysql client (ports 3307, 3308, 3309):
+    mysql -h127.0.0.1 -P3307 -uroot -ppaystrata
+
+Connect with mysqlsh (from the "shell" container):
+    docker compose exec shell mysqlsh --uri root:paystrata@mysql1:3306 --sql
+    docker compose exec shell mysqlsh --uri root:paystrata@mysql1:3306 --js      (JavaScript mode)
+
+Group state (run on any node):
+    SELECT MEMBER_HOST, MEMBER_STATE, MEMBER_ROLE FROM performance_schema.replication_group_members;
+    SELECT @@hostname, @@read_only, @@super_read_only;
+    SELECT * FROM performance_schema.replication_group_member_stats\G
+
+Connections and limits (on the primary):
+    SHOW GLOBAL VARIABLES LIKE 'max_connections';
+    SET GLOBAL max_connections = 1000;
+    SHOW GLOBAL STATUS LIKE 'Threads_connected';
+    SHOW GLOBAL STATUS LIKE 'Max_used_connections';
+    SHOW GLOBAL STATUS LIKE 'Connection_errors_max_connections';
+    SHOW GLOBAL STATUS LIKE 'Aborted_connects';
+    SELECT USER, COUNT(*) FROM performance_schema.processlist GROUP BY USER;
+    SELECT logged, prio, LEFT(data,100) FROM performance_schema.error_log ORDER BY logged DESC LIMIT 20;
+
+The error 1040, by hand (set a tiny limit, then open two sessions):
+    SET GLOBAL max_connections = 3;      -- then connect 4 times: ERROR 1040 (08004): Too many connections
+    (the root user still gets in through the extra administrator slot)
+
+Application user, direct to the primary or through the proxy:
+    docker compose exec shell mysql -h mysql1 -P3306 -uapp -papp_pass paystrata
+    docker compose exec shell mysql -h proxysql -P6033 -uapp -papp_pass paystrata
+    SELECT @@hostname;                                           -- which node served it
+    UPDATE heartbeat SET n = n + 1, last_writer = @@hostname WHERE id = 1;
+    SELECT n, last_writer FROM heartbeat WHERE id = 1;
+
+ProxySQL admin:
+    docker compose exec shell mysql -h proxysql -P6032 -uradmin -pradmin
+    SELECT hostgroup_id, hostname, status FROM runtime_mysql_servers;
+    SELECT rule_id, match_pattern, destination_hostgroup, hits FROM runtime_mysql_query_rules JOIN stats_mysql_query_rules USING (rule_id);
+    SELECT hostgroup, srv_host, status, ConnUsed, ConnFree, Queries FROM stats_mysql_connection_pool;
+    SELECT Variable_Name, Variable_Value FROM stats_mysql_global WHERE Variable_Name LIKE 'Client_Connections%';
+    SELECT hostgroup, digest_text, count_star FROM stats_mysql_query_digest ORDER BY count_star DESC;
+
+Crash and recovery by hand:
+    docker compose kill mysql1                  -- the crash (SIGKILL)
+    docker compose exec mysql2 mysql -uroot -ppaystrata -e "SELECT MEMBER_HOST, MEMBER_STATE, MEMBER_ROLE FROM performance_schema.replication_group_members"
+    docker compose start mysql1                 -- then, on mysql1:  START GROUP_REPLICATION;
+    (2 nodes only, no quorum:  SET GLOBAL group_replication_force_members = 'mysql2:33061';
+     then SET GLOBAL group_replication_force_members = '';)
+
+
+CLEAN UP
+--------
+    docker compose --profile proxy --profile tools down -v      destroys containers, network, data
+    wsl --shutdown   (PowerShell)                               stops WSL2 and frees its memory
+
+
+EXPERIMENTS TO TRY
+------------------
+1. Step 2 with MAXCONN=300: where does the refusal start now?
+2. Step 3 with mysql_servers.max_connections = 5 in conf/proxysql3.cnf: what changes in the
+   proxy_backend column and in queries/s?
+3. Kill a SECONDARY instead of the primary (docker compose kill mysql2): what does the application
+   see? What does ProxySQL do with HG20?
+4. Kill 2 of 3 nodes: the survivor has no quorum. What do the reads do through the proxy?
+5. Remove rule 10 (SELECT ... FOR UPDATE) from conf/proxysql3.cnf and run step 5: where does the
+   FOR UPDATE go now, and why is that dangerous?
+
+Mini-challenge: the application reads its own write right after a payment (INSERT, then SELECT
+on the same row). With these rules the SELECT goes to a reader, and replication is asynchronous
+by default (group_replication_consistency = EVENTUAL). Name two ways to make sure it sees the
+row, and the price of each.
+
+
+IF SOMETHING GOES WRONG
+-----------------------
+  "command not found: docker-compose"   Docker Desktop > Settings > Resources > WSL integration: enable Ubuntu; check "docker compose version"
+  mysqlsh not found                     the "shell" service uses the mysql:8.4 image, which ships mysqlsh (mysql:8.0 does not)
+  A node does not reach ONLINE          docker compose logs mysql2
+  Ports 3307-3309, 6032, 6033 are busy  change them in docker-compose.yml
+  "/etc/mysql/conf.d/gr.cnf not found"   you changed conf/ while the containers ran: ./step1_cluster.sh again
+  Writes stuck, group "unreachable"    the load starved Group Replication (see the WARNING at the end of
+                                        step 2). More CPUs in .wslconfig, or LEVELS=1000,2000,5000
+  Step 2 or 3 is killed or very slow    10,000 client threads need memory and file descriptors:
+                                        raise memory in .wslconfig (memory=12GB), then wsl --shutdown;
+                                        or use LEVELS=1000,2000,5000 ./step2_limit.sh
+  "No cluster running"                  run ./step1_cluster.sh first
+  ProxySQL shows no servers             wait 10 seconds, the monitor needs a few checks;
+                                        then ./proxy_status.sh
+  The chart is empty or missing         run the steps first, ./plot.sh draws the ones that have results

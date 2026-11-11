@@ -1,0 +1,7 @@
+# The scripts and the mounted config run on Linux (WSL2): keep Unix line endings (LF), also on Windows.
+*.sh   text eol=lf
+*.cnf  text eol=lf
+*.py   text eol=lf
+*.yml  text eol=lf
+Dockerfile text eol=lf
+*.txt  text eol=lf

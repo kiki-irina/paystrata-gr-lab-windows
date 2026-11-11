@@ -1,0 +1,48 @@
+datadir="/var/lib/proxysql"
+
+admin_variables=
+{
+  admin_credentials="admin:admin;radmin:radmin"
+  mysql_ifaces="0.0.0.0:6032"
+}
+
+mysql_variables=
+{
+  threads=4
+  max_connections=12000
+  interfaces="0.0.0.0:6033"
+  server_version="8.0.36"
+  monitor_username="proxymon"
+  monitor_password="proxymon"
+  monitor_connect_interval=2000
+  monitor_ping_interval=1000
+  monitor_read_only_interval=1000
+  monitor_read_only_timeout=800
+  ping_timeout_server=500
+}
+
+# Both nodes start in the writer hostgroup (10). The monitor checks read_only:
+# read_only=1 (secondary) -> also placed in the reader hostgroup (20).
+mysql_servers=
+(
+  { address="mysql1", port=3306, hostgroup=10, max_connections=50 },
+  { address="mysql2", port=3306, hostgroup=10, max_connections=50 },
+  { address="mysql3", port=3306, hostgroup=10, max_connections=50 }
+)
+
+mysql_replication_hostgroups=
+(
+  { writer_hostgroup=10, reader_hostgroup=20, comment="PayStrata GR single-primary" }
+)
+
+mysql_users=
+(
+  { username="app", password="app_pass", default_hostgroup=10, active=1 }
+)
+
+mysql_query_rules=
+(
+  { rule_id=10, active=1, match_pattern="^SELECT .* FOR UPDATE", destination_hostgroup=10, apply=1 },
+  { rule_id=20, active=1, match_pattern="^SELECT",               destination_hostgroup=20, apply=1 },
+  { rule_id=30, active=1, match_pattern="^(INSERT|UPDATE|DELETE|REPLACE)", destination_hostgroup=10, apply=1 }
+)
